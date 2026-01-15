@@ -9,8 +9,8 @@
     <arg name="optical_flow" default="true"/>
     <arg name="aruco" default="false"/>
     <arg name="rangefinder_vl53l1x" default="true"/>
-    <arg name="led" default="true"/>
-    <arg name="blocks" default="false"/>
+    <arg name="led" default="false"/>
+    <arg name="blocks" default="true"/>
     <arg name="rc" default="false"/>
     <arg name="force_init" default="true"/> <!-- force estimator to init by publishing zero pose -->
 
