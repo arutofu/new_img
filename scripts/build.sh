@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+BUILD_START_EPOCH="$(date +%s)"
+
 ENV_FILE="${1:?env}"
 CACHE_DIR="${2:?cache}"
 BUILD_DIR="${3:?build}"
@@ -40,6 +42,10 @@ fi
 TMP_PROV="$BUILD_DIR/provision.sh"
 cp -a "$(dirname "$0")/provision.sh" "$TMP_PROV"
 
+# Build version for /etc/drone_version (from final image name stamp)
+STAMP="$(date +%Y%m%d_%H%M%S)"
+BUILD_VERSION="$STAMP"
+
 ENABLE_SSH="$ENABLE_SSH" \
 PI_USER="$PI_USER" \
 PI_PASSWORD="$PI_PASSWORD" \
@@ -47,13 +53,36 @@ EXTRA_APT_PACKAGES="$EXTRA_APT_PACKAGES" \
 INSTALL_ROS="${INSTALL_ROS:-false}" \
 ROS_DISTRO="${ROS_DISTRO:-noetic}" \
 INSTALL_DRONE="${INSTALL_DRONE:-false}" \
+BUILD_VERSION="$BUILD_VERSION" \
 bash "$(dirname "$0")/image_chroot.sh" "$WORK_IMG" exec "$TMP_PROV"
 
 bash "$(dirname "$0")/image_resize.sh" "$WORK_IMG" min "$FINAL_FREE_MIB"
 
-STAMP="$(date +%Y%m%d_%H%M%S)"
+# --- финальное имя образа ---
 OUT_IMG="$OUT_DIR/${OUT_NAME_PREFIX}_${STAMP}.img"
-mv -f "$WORK_IMG" "$OUT_IMG"
+OUT_XZ="${OUT_IMG}.xz"
 
-echo "DONE: $OUT_IMG"
-ls -lh "$OUT_IMG"
+# переносим work.img в out под финальным именем
+mv -f "$WORK_IMG" "$OUT_IMG"
+sync
+
+echo "Compressing image to xz..."
+# -T0  → все ядра
+# -6   → баланс скорость/размер
+xz -T0 -6 --verbose "$OUT_IMG"
+
+# Удаляем исходный .img, оставляем только .xz
+rm -f "$OUT_IMG"
+
+# Время сборки (до DONE, как ты просил)
+BUILD_END_EPOCH="$(date +%s)"
+BUILD_SECS="$((BUILD_END_EPOCH - BUILD_START_EPOCH))"
+
+HOURS=$((BUILD_SECS / 3600))
+MINUTES=$(((BUILD_SECS % 3600) / 60))
+SECONDS=$((BUILD_SECS % 60))
+
+printf "BUILD TIME: %02d:%02d:%02d\n" "$HOURS" "$MINUTES" "$SECONDS"
+
+echo "DONE: $OUT_XZ"
+ls -lh "$OUT_XZ"

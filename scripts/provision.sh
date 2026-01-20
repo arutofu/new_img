@@ -6,8 +6,15 @@ export DEBIAN_FRONTEND=noninteractive
 # provision.sh (Clover-like)
 # - fixes apt order + buster archived repos
 # - pinned cmake 3.13.4-1 (buster)
-# - adds systemd services: rosbridge(9090), drone(roslaunch), butterfly(57575)
+# - adds systemd services: drone(roslaunch), butterfly(57575)
+# - installs ros web tools: rosbridge-server + web_video_server
+# - installs MAVROS + pymavlink for selfcheck
 # - fixes Wi-Fi AP: rfkill unblock before hostapd + dnsmasq waits for wlan0
+# - adds WPA2 password for Wi-Fi AP (default: dronewifi)
+# - fixes roswww_static autogen (drone-www.service) vs symlinked ~/.ros/www/*
+# - auto-sources ROS env on login (ssh/tty) so rosrun/roslaunch work
+# - installs udev rules from catkin_ws/src/drone/udev (if present)
+# - adds package entrypoint so `rosrun drone selfcheck` works
 # ============================================================
 
 # -----------------------------
@@ -34,6 +41,9 @@ WIFI_DHCP_START="${WIFI_DHCP_START:-192.168.11.20}"
 WIFI_DHCP_END="${WIFI_DHCP_END:-192.168.11.200}"
 WIFI_DHCP_LEASE="${WIFI_DHCP_LEASE:-12h}"
 
+# Wi-Fi security (WPA2-PSK). Default password per your request.
+WIFI_AP_PSK="${WIFI_AP_PSK:-dronewifi}"
+
 ENABLE_MDNS="${ENABLE_MDNS:-true}"
 
 ENABLE_WEB="${ENABLE_WEB:-true}"
@@ -46,15 +56,21 @@ AUTOLOGIN_TTY1="${AUTOLOGIN_TTY1:-true}"
 
 EXTRA_APT_PACKAGES="${EXTRA_APT_PACKAGES:-}"
 
-# Optional services
+# Optional services / web tooling
 ENABLE_ROS_AUTOSTART="${ENABLE_ROS_AUTOSTART:-true}"
-ENABLE_ROSBRIDGE="${ENABLE_ROSBRIDGE:-true}"
+
+# NOTE: In Clover-like setup rosbridge is started from drone.launch.
+# Standalone rosbridge service is OFF by default to avoid duplicate masters/run_id mismatch.
+ENABLE_ROSBRIDGE_SERVICE="${ENABLE_ROSBRIDGE_SERVICE:-false}"
 ROSBRIDGE_PORT="${ROSBRIDGE_PORT:-9090}"
-ROSBRIDGE_IN_DRONE_LAUNCH=\"${ROSBRIDGE_IN_DRONE_LAUNCH:-true}\"
-ENABLE_WEB_VIDEO_SERVER=\"${ENABLE_WEB_VIDEO_SERVER:-true}\"
-WEB_VIDEO_PORT=\"${WEB_VIDEO_PORT:-8080}\"
+
 ENABLE_BUTTERFLY="${ENABLE_BUTTERFLY:-true}"
 BUTTERFLY_PORT="${BUTTERFLY_PORT:-57575}"
+
+# Install web_video_server package (used by drone.launch). Standalone systemd service is OFF by default.
+ENABLE_WEB_VIDEO_SERVER="${ENABLE_WEB_VIDEO_SERVER:-true}"
+ENABLE_WEB_VIDEO_SERVER_SERVICE="${ENABLE_WEB_VIDEO_SERVER_SERVICE:-false}"
+WEB_VIDEO_PORT="${WEB_VIDEO_PORT:-8080}"
 
 # Clover pinned CMake (buster native)
 CMAKE_VER="${CMAKE_VER:-3.13.4-1}"
@@ -344,18 +360,43 @@ EOF
   fi
 }
 
-install_base_build_deps() {
-  info "Install base build dependencies"
-  apt_install \
-    bash coreutils findutils grep sed gawk \
-    build-essential make \
-    git \
-    python3 python3-pip python3-dev \
-    pkg-config \
-    ca-certificates curl wget \
-    libxml2-dev || true
-
-  have_cmd cc || die "C compiler not found after build-essential"
+install_additional_software(){
+  info "Install additional software"
+  apt-get update
+  apt-get install --no-install-recommends -y \
+  unzip \
+  zip \
+  ipython \
+  ipython3 \
+  screen \
+  byobu  \
+  nmap \
+  lsof \
+  git \
+  dnsmasq  \
+  tmux \
+  tree \
+  vim \
+  libjpeg8 \
+  tcpdump \
+  libpoco-dev \
+  libzbar0 \
+  python3-rosdep \
+  python3-rosinstall-generator \
+  python3-wstool \
+  python3-rosinstall \
+  build-essential \
+  libffi-dev \
+  monkey \
+  pigpio python-pigpio python3-pigpio \
+  i2c-tools \
+  espeak espeak-data python-espeak python3-espeak \
+  ntpdate \
+  python-dev \
+  python3-dev \
+  python-systemd \
+  mjpg-streamer \
+  python3-opencv
 }
 
 install_extra_packages() {
@@ -390,30 +431,163 @@ install_ros_if_needed() {
   ok "ROS installed: ${ROS_DISTRO}"
 }
 
+install_geographiclib_geoids_like_clover() {
+  info "Ensure GeographicLib geoids are installed (needed by MAVROS)"
+
+  if dpkg -l 2>/dev/null | grep -qE '^ii\s+geographiclib-geoids(\s|$)'; then
+    ok "geographiclib-geoids package installed"
+    return 0
+  fi
+
+  if have_cmd geographiclib-get-geoids; then
+    info "Running geographiclib-get-geoids egm96-5 (best-effort)"
+    my_travis_retry geographiclib-get-geoids egm96-5 || true
+  fi
+
+  local mavros_script="/opt/ros/${ROS_DISTRO}/lib/mavros/install_geographiclib_datasets.sh"
+  if [[ -f "${mavros_script}" ]]; then
+    info "Running MAVROS dataset installer (best-effort)"
+    /bin/bash "${mavros_script}" || true
+  fi
+
+  if [[ -d /usr/share/GeographicLib/geoids ]] || [[ -d /usr/share/geographiclib/geoids ]]; then
+    ok "GeographicLib geoids directory present"
+    return 0
+  fi
+
+  warn "GeographicLib geoids not detected (may still work depending on your use-case)."
+  return 0
+}
+
 install_ros_web_tools() {
-  # Эти пакеты нужны именно для WEB UI (topics.html) и т.п.
   if [[ "${INSTALL_ROS}" != "true" ]]; then
     info "INSTALL_ROS=false -> skip ROS web tools install"
     return 0
   fi
 
-  info "Install ROS web tools (rosbridge-server)"
+  info "Install ROS web tools + MAVROS (rosbridge-server + web-video-server + mavros)"
   apt_update
-  apt_install "ros-${ROS_DISTRO}-rosbridge-server" || {
-    apt_policy_dump
-    die "Failed to install rosbridge-server"
-  }
 
-if [[ "${ENABLE_WEB_VIDEO_SERVER}" == "true" ]]; then
-  info "Install ROS video tools (web_video_server)"
-  apt_install "ros-${ROS_DISTRO}-web-video-server" || {
-    apt_policy_dump
-    die "Failed to install web-video-server"
-  }
-else
-  info "ENABLE_WEB_VIDEO_SERVER=false -> skip web_video_server install"
-fi
+  local pkgs=(
+    "ros-${ROS_DISTRO}-rosbridge-server"
+  )
 
+  if [[ "${ENABLE_WEB_VIDEO_SERVER}" == "true" ]]; then
+    pkgs+=("ros-${ROS_DISTRO}-web-video-server")
+  fi
+
+  pkgs+=(
+    "ros-${ROS_DISTRO}-mavros"
+    "ros-${ROS_DISTRO}-mavros-extras"
+    geographiclib-tools
+  )
+
+  local optional_pkgs=(
+    geographiclib-doc
+    python3-rosinstall
+    python3-rosinstall-generator
+    python3-wstool
+  )
+
+  if ! apt_install "${pkgs[@]}"; then
+    apt_policy_dump
+    die "Failed to install ROS web tools/MAVROS"
+  fi
+
+  for p in "${optional_pkgs[@]}"; do
+    apt_install "$p" || true
+  done
+
+  # pymavlink for python selfcheck (best-effort)
+  if apt-cache show python3-pymavlink >/dev/null 2>&1; then
+    apt_install python3-pymavlink || true
+  else
+    info "python3-pymavlink not available via apt -> use apt deps + pip --no-deps to avoid lxml build on buster"
+    # avoid building lxml from source (buster pip/pytoml breaks on modern pyproject.toml)
+    apt_install python3-lxml python3-future python3-numpy || true
+    my_travis_retry pip3 install --no-cache-dir --no-deps "pymavlink==2.4.39" || true
+  fi
+
+  install_geographiclib_geoids_like_clover || true
+
+  ok "ROS web tools/MAVROS installed"
+}
+
+install_base_build_deps() {
+  info "Install base build dependencies"
+  apt_install \
+    bash coreutils findutils grep sed gawk \
+    build-essential make \
+    git \
+    python3 python3-pip python3-dev \
+    pkg-config \
+    ca-certificates curl wget || true
+  have_cmd cc || die "C compiler not found after build-essential"
+
+  info "Installing OpenCV 4.2-compatible ROS packages"
+  apt install -y --no-install-recommends \
+  ros-${ROS_DISTRO}-compressed-image-transport=1.14.0-0buster \
+  ros-${ROS_DISTRO}-cv-bridge=1.15.0-0buster \
+  ros-${ROS_DISTRO}-cv-camera=0.5.1-0buster \
+  ros-${ROS_DISTRO}-image-publisher=1.15.3-0buster \
+  ros-${ROS_DISTRO}-web-video-server=0.2.1-0buster
+  apt-mark hold \
+  ros-${ROS_DISTRO}-compressed-image-transport \
+  ros-${ROS_DISTRO}-cv-bridge \
+  ros-${ROS_DISTRO}-cv-camera \
+  ros-${ROS_DISTRO}-image-publisher \
+  ros-${ROS_DISTRO}-web-video-server
+}
+
+install_aruco_pose_like_clover() {
+  if [[ "${INSTALL_ROS}" != "true" ]]; then
+    info "INSTALL_ROS=false -> skip aruco_pose"
+    return 0
+  fi
+
+  info "Install/ensure aruco_pose (local repo, Clover-like behavior)"
+
+  local ws_src="${CATKIN_WS}/src"
+  local target="${ws_src}/aruco_pose"
+
+  # Where your repository is located inside the target filesystem
+  # Example from you: /home/artem/work/new_img/drone/catkin_ws/src/aruco_pose
+  local repo_root="${CATKIN_WS}/src/aruco_pose"
+  local src_local="${repo_root}/drone/catkin_ws/src/aruco_pose"
+
+  mkdir -p "${ws_src}"
+
+  # If already present in workspace - OK
+  if [[ -d "${target}" ]]; then
+    ok "aruco_pose already present in workspace: ${target}"
+  else
+    # Prefer local copy (no network)
+    if [[ -d "${src_local}" ]]; then
+      info "Copy aruco_pose from local repo: ${src_local} -> ${target}"
+      cp -a "${src_local}" "${target}"
+      ok "Copied aruco_pose into workspace: ${target}"
+    else
+      warn "Local aruco_pose not found at ${src_local}"
+      warn "Set NEW_IMG_SRC_ROOT to the repo path inside image, or add aruco_pose via other method."
+      return 0
+    fi
+  fi
+
+  # Build it so it becomes runnable via rosrun/roslaunch
+  if [[ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]]; then
+    info "Rebuild catkin_ws to compile aruco_pose"
+    set +u
+    # shellcheck disable=SC1090
+    source "/opt/ros/${ROS_DISTRO}/setup.bash" || true
+    set -u
+    (cd "${CATKIN_WS}" && catkin_make 2>&1 | tee /var/log/drone_catkin_make_aruco.log) || {
+      warn "catkin_make for aruco_pose failed (see /var/log/drone_catkin_make_aruco.log)"
+      return 0
+    }
+    ok "aruco_pose build OK"
+  else
+    warn "ROS not found at /opt/ros/${ROS_DISTRO}/setup.bash -> cannot build aruco_pose"
+  fi
 }
 
 # -----------------------------
@@ -486,6 +660,24 @@ build_drone_if_needed() {
   ok "Drone build OK"
 }
 
+additional_ROS_packages(){
+  info "Installing additional ROS packages"
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    ros-${ROS_DISTRO}-rosbridge-suite \
+    ros-${ROS_DISTRO}-rosserial \
+    ros-${ROS_DISTRO}-usb-cam \
+    ros-${ROS_DISTRO}-vl53l1x \
+    ros-${ROS_DISTRO}-ws281x \
+    ros-${ROS_DISTRO}-rosshow \
+    ros-${ROS_DISTRO}-cmake-modules \
+    ros-${ROS_DISTRO}-image-view \
+    ros-${ROS_DISTRO}-nodelet-topic-tools \
+    ros-${ROS_DISTRO}-stereo-msgs \
+    ros-${ROS_DISTRO}-vision-msgs \
+    ros-${ROS_DISTRO}-angles
+}
+
 # -----------------------------
 # Console autologin
 # -----------------------------
@@ -540,16 +732,13 @@ setup_wifi_ap() {
   info "Setup Wi-Fi Access Point (hostapd/dnsmasq)"
   apt_install hostapd dnsmasq iptables iptables-persistent rfkill || true
 
-  # Ensure rfkill unblock happens on boot BEFORE these
   setup_wifi_rfkill_unblock_service
 
-  # Stop services during image build
   systemctl disable hostapd 2>/dev/null || true
   systemctl disable dnsmasq 2>/dev/null || true
   systemctl stop hostapd 2>/dev/null || true
   systemctl stop dnsmasq 2>/dev/null || true
 
-  # Static IP for wlan0
   if [[ -f /etc/dhcpcd.conf ]]; then
     if ! grep -q "^interface wlan0" /etc/dhcpcd.conf; then
       cat >>/etc/dhcpcd.conf <<EOF
@@ -561,7 +750,6 @@ EOF
     fi
   fi
 
-  # dnsmasq DHCP for wlan0 (bind-dynamic = НЕ падать если wlan0 ещё не поднят)
   mkdir -p /etc/dnsmasq.d
   cat >/etc/dnsmasq.d/drone-ap.conf <<EOF
 interface=wlan0
@@ -571,8 +759,8 @@ domain-needed
 bogus-priv
 EOF
 
-  # hostapd config template
   mkdir -p /etc/hostapd
+
   cat >/etc/hostapd/hostapd.conf <<EOF
 country_code=${WIFI_COUNTRY}
 interface=wlan0
@@ -583,10 +771,13 @@ channel=${WIFI_CHANNEL}
 ieee80211n=1
 wmm_enabled=1
 auth_algs=1
-wpa=0
+
+wpa=2
+wpa_passphrase=${WIFI_AP_PSK}
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
 EOF
 
-  # Ensure hostapd uses our config
   if [[ -f /etc/default/hostapd ]]; then
     sed -i 's/^#\?DAEMON_CONF=.*/DAEMON_CONF="\/etc\/hostapd\/hostapd.conf"/' /etc/default/hostapd || true
     grep -q '^DAEMON_CONF=' /etc/default/hostapd || echo 'DAEMON_CONF="/etc/hostapd/hostapd.conf"' >> /etc/default/hostapd
@@ -596,7 +787,6 @@ DAEMON_CONF="/etc/hostapd/hostapd.conf"
 EOF
   fi
 
-  # systemd: make dnsmasq wait for wlan0
   mkdir -p /etc/systemd/system/dnsmasq.service.d
   cat >/etc/systemd/system/dnsmasq.service.d/override.conf <<'EOF'
 [Unit]
@@ -604,12 +794,10 @@ After=sys-subsystem-net-devices-wlan0.device
 Wants=sys-subsystem-net-devices-wlan0.device
 EOF
 
-  # Enable routing
   cat >/etc/sysctl.d/99-drone-ipforward.conf <<'EOF'
 net.ipv4.ip_forward=1
 EOF
 
-  # NAT rules (wlan0 -> eth0)
   mkdir -p /etc/iptables
   cat >/etc/iptables/rules.v4 <<'EOF'
 *filter
@@ -628,7 +816,6 @@ COMMIT
 COMMIT
 EOF
 
-  # First-boot SSID generator
   cat >/usr/local/sbin/drone-generate-ssid.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -712,9 +899,10 @@ Wants=network-online.target
 [Service]
 User=${PI_USER}
 Group=${PI_USER}
+WorkingDirectory=/
 ExecStart=/usr/local/bin/filebrowser \
   --noauth \
-  --root=/home \
+  --root=/ \
   --address=0.0.0.0 \
   --port=${FILEBROWSER_PORT} \
   --database=/var/lib/filebrowser/filebrowser.db
@@ -747,6 +935,12 @@ setup_static_web_like_clover() {
 
   mkdir -p "$www_root"
   chown -R "${PI_USER}:${PI_USER}" "/home/${PI_USER}/.ros" || true
+
+  for pkg in drone drone_blocks; do
+    if [[ -L "${www_root}/${pkg}" ]]; then
+      rm -f "${www_root}/${pkg}" || true
+    fi
+  done
 
   cat >/etc/nginx/sites-available/drone <<EOF
 server {
@@ -782,7 +976,7 @@ ROSWWW_DEFAULT=drone
 ROSWWW_STATIC_PATH=${srcdir}
 EOF
 
-  cat >/usr/local/sbin/drone-www-update.sh <<'EOF'
+cat >/usr/local/sbin/drone-www-update.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -793,6 +987,13 @@ fi
 
 export ROSWWW_DEFAULT="${ROSWWW_DEFAULT:-drone}"
 export ROSWWW_STATIC_PATH="${ROSWWW_STATIC_PATH:-/home/pi/catkin_ws/src/drone/www}"
+
+WWW_DIR="/home/pi/.ros/www"
+mkdir -p "${WWW_DIR}"
+
+# IMPORTANT:
+# roswww_static expects real directories under ~/.ros/www.
+rm -rf "${WWW_DIR}/drone" "${WWW_DIR}/drone_blocks" 2>/dev/null || true
 
 setup_ros="/opt/ros/${ROS_DISTRO:-noetic}/setup.bash"
 setup_ws="/home/pi/catkin_ws/devel/setup.bash"
@@ -831,20 +1032,18 @@ EOF
 }
 
 # -----------------------------
-# ROS systemd services (autostart like Clover image behavior)
+# ROS systemd services
 # -----------------------------
 write_ros_env_file() {
   cat >/etc/default/ros <<EOF
 ROS_DISTRO=${ROS_DISTRO}
 ROS_MASTER_URI=http://localhost:11311
-# Для локальной машины это не критично; при желании можно заменить на HOST_NAME.local:
-# ROS_HOSTNAME=${HOST_NAME}.local
 EOF
 }
 
 setup_rosbridge_service() {
   [[ "${ENABLE_ROS_AUTOSTART}" == "true" ]] || { info "ENABLE_ROS_AUTOSTART=false -> skip ros services"; return 0; }
-  [[ "${ENABLE_ROSBRIDGE}" == "true" ]] || { info "ENABLE_ROSBRIDGE=false -> skip rosbridge"; return 0; }
+  [[ "${ENABLE_ROSBRIDGE_SERVICE}" == "true" ]] || { info "ENABLE_ROSBRIDGE_SERVICE=false -> skip standalone rosbridge (drone.launch starts it)"; return 0; }
 
   info "Create rosbridge-websocket systemd service (ws://0.0.0.0:${ROSBRIDGE_PORT})"
   write_ros_env_file
@@ -872,55 +1071,17 @@ EOF
   systemctl enable rosbridge-websocket.service 2>/dev/null || true
 }
 
-setup_web_video_server_service() {
-  [[ "${ENABLE_ROS_AUTOSTART}" == "true" ]] || { info "ENABLE_ROS_AUTOSTART=false -> skip web_video_server service"; return 0; }
-  [[ "${ENABLE_WEB_VIDEO_SERVER}" == "true" ]] || { info "ENABLE_WEB_VIDEO_SERVER=false -> skip web_video_server"; return 0; }
-
-  info "Create web-video-server systemd service (http://0.0.0.0:${WEB_VIDEO_PORT})"
-  write_ros_env_file
-
-  cat >/etc/systemd/system/web-video-server.service <<EOF
-[Unit]
-Description=ROS web_video_server (HTTP MJPEG stream)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-EnvironmentFile=/etc/default/ros
-User=${PI_USER}
-Group=${PI_USER}
-WorkingDirectory=/home/${PI_USER}
-ExecStart=/bin/bash -lc 'source /opt/ros/\${ROS_DISTRO}/setup.bash && rosrun web_video_server web_video_server _address:=0.0.0.0 _port:=${WEB_VIDEO_PORT}'
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl enable web-video-server.service 2>/dev/null || true
-}
-
 setup_drone_launch_service() {
   [[ "${ENABLE_ROS_AUTOSTART}" == "true" ]] || return 0
 
   info "Create drone systemd service (roslaunch drone drone.launch)"
   write_ros_env_file
 
-  local after_line wants_line
-  after_line="After=network-online.target"
-  wants_line="Wants=network-online.target"
-  if [[ "${ENABLE_ROSBRIDGE}" == "true" ]] && [[ "${ROSBRIDGE_IN_DRONE_LAUNCH}" != "true" ]]; then
-    after_line="After=network-online.target rosbridge-websocket.service"
-    wants_line=$'Wants=network-online.target\nWants=rosbridge-websocket.service'
-  fi
-
   cat >/etc/systemd/system/drone.service <<EOF
 [Unit]
 Description=Drone main ROS launch
-${after_line}
-${wants_line}
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -939,30 +1100,53 @@ EOF
   systemctl enable drone.service 2>/dev/null || true
 }
 
-# -----------------------------
-# Butterfly (FIXED)
-# -----------------------------
+setup_web_video_server() {
+  [[ "${ENABLE_WEB_VIDEO_SERVER_SERVICE}" == "true" ]] || { info "ENABLE_WEB_VIDEO_SERVER_SERVICE=false -> skip standalone web-video-server (drone.launch starts it)"; return 0; }
+  [[ "${INSTALL_ROS}" == "true" ]] || { info "INSTALL_ROS=false -> skip web-video-server service"; return 0; }
+
+  info "Create standalone web-video-server systemd service (http://0.0.0.0:${WEB_VIDEO_PORT})"
+  write_ros_env_file
+
+  cat >/etc/systemd/system/web-video-server.service <<EOF
+[Unit]
+Description=ROS web_video_server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/ros
+User=${PI_USER}
+Group=${PI_USER}
+WorkingDirectory=/home/${PI_USER}
+ExecStart=/bin/bash -lc 'source /opt/ros/\${ROS_DISTRO}/setup.bash && exec rosrun web_video_server web_video_server _port:=${WEB_VIDEO_PORT} _address:=0.0.0.0'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl enable web-video-server.service 2>/dev/null || true
+}
+
 setup_butterfly_service() {
   [[ "${ENABLE_BUTTERFLY}" == "true" ]] || { info "ENABLE_BUTTERFLY=false -> skip"; return 0; }
   info "Install butterfly web terminal + systemd service on :${BUTTERFLY_PORT}"
 
-  apt_install python3 python3-pip || true
+  apt_install python3-pip || true
+  my_travis_retry pip3 install --no-cache-dir butterfly || true
 
-  # Use python3 -m pip to avoid mismatched pip/pip3
-  my_travis_retry python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel || true
-  my_travis_retry python3 -m pip install --no-cache-dir --upgrade butterfly || true
-
-  # Determine real server entrypoint (launcher 'butterfly' may not accept --host/--port)
-  local server_bin launcher
-  server_bin="$(command -v butterfly.server.py 2>/dev/null || true)"
-  if [[ -z "${server_bin}" ]]; then
-    launcher="$(command -v butterfly 2>/dev/null || true)"
-    if [[ -n "${launcher}" ]] && [[ -f "$(dirname "${launcher}")/butterfly.server.py" ]]; then
-      server_bin="$(dirname "${launcher}")/butterfly.server.py"
+  local server="/usr/local/bin/butterfly.server.py"
+  if [[ ! -x "${server}" ]]; then
+    local alt
+    alt="$(command -v butterfly.server.py 2>/dev/null || true)"
+    if [[ -n "${alt}" ]]; then
+      server="${alt}"
+    else
+      warn "butterfly.server.py not found in PATH; using default ${server} anyway"
     fi
   fi
-  [[ -n "${server_bin}" ]] || [[ -f /usr/local/bin/butterfly.server.py ]] && server_bin="${server_bin:-/usr/local/bin/butterfly.server.py}"
-  [[ -n "${server_bin}" ]] || die "butterfly.server.py not found after install. Check: ls -la /usr/local/bin | grep -i butterfly"
 
   cat >/etc/systemd/system/butterfly.service <<EOF
 [Unit]
@@ -975,7 +1159,7 @@ Type=simple
 User=${PI_USER}
 Group=${PI_USER}
 WorkingDirectory=/home/${PI_USER}
-ExecStart=/bin/bash -lc 'exec ${server_bin} --host=0.0.0.0 --port=${BUTTERFLY_PORT} --unsecure'
+ExecStart=/bin/bash -lc 'exec ${server} --unsecure --i-hereby-declare-i-dont-want-any-security-whatsoever --host=0.0.0.0 --port=${BUTTERFLY_PORT}'
 Restart=on-failure
 RestartSec=2
 
@@ -984,7 +1168,94 @@ WantedBy=multi-user.target
 EOF
 
   systemctl enable butterfly.service 2>/dev/null || true
-  systemctl daemon-reload 2>/dev/null || true
+}
+
+# -----------------------------
+# udev rules (FCU / sensors)
+# -----------------------------
+setup_drone_udev_rules() {
+  local udev_dir="${CATKIN_WS}/src/drone/udev"
+  if [[ -d "${udev_dir}" ]]; then
+    info "Install udev rules from ${udev_dir}"
+    mkdir -p /etc/udev/rules.d
+    cp -f "${udev_dir}"/*.rules /etc/udev/rules.d/ 2>/dev/null || true
+    chmod 0644 /etc/udev/rules.d/*.rules 2>/dev/null || true
+    usermod -a -G dialout,video,i2c,spi,gpio "${PI_USER}" 2>/dev/null || true
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
+  else
+    info "No udev rules dir found at ${udev_dir} -> skip"
+  fi
+}
+
+# -----------------------------
+# Make `rosrun drone selfcheck` work (package-level entrypoint)
+# -----------------------------
+setup_drone_entrypoints() {
+  local pkg_dir="${CATKIN_WS}/src/drone"
+  local src_py="${pkg_dir}/src/selfcheck.py"
+
+  if [[ ! -d "${pkg_dir}" ]]; then
+    info "drone package dir not found at ${pkg_dir} -> skip entrypoints"
+    return 0
+  fi
+
+  if [[ -f "${src_py}" ]]; then
+    info "Create entrypoint: ${pkg_dir}/selfcheck (so rosrun finds it)"
+    cat >"${pkg_dir}/selfcheck" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "${DIR}/src/selfcheck.py" "$@"
+EOF
+    chmod +x "${pkg_dir}/selfcheck" || true
+
+    # Optional: convenient symlink
+    ln -sf "src/selfcheck.py" "${pkg_dir}/selfcheck.py" || true
+    chmod +x "${pkg_dir}/selfcheck.py" 2>/dev/null || true
+  else
+    warn "selfcheck.py not found at ${src_py} -> entrypoint not created"
+  fi
+}
+
+# -----------------------------
+# Auto-source ROS env for interactive shells (ssh/tty)
+# -----------------------------
+setup_ros_shell_autosource() {
+  info "Setup ROS environment autosource for interactive shells"
+  cat >/etc/profile.d/ros-drone.sh <<EOF
+# Auto-source ROS + catkin_ws for interactive shells
+case "\$-" in
+  *i*) ;;
+  *) return 0 ;;
+esac
+
+# ROS
+if [ -f /opt/ros/${ROS_DISTRO}/setup.bash ]; then
+  . /opt/ros/${ROS_DISTRO}/setup.bash
+fi
+
+# Workspace (prefer current user)
+if [ -n "\$HOME" ] && [ -f "\$HOME/catkin_ws/devel/setup.bash" ]; then
+  . "\$HOME/catkin_ws/devel/setup.bash"
+elif [ -f /home/pi/catkin_ws/devel/setup.bash ]; then
+  . /home/pi/catkin_ws/devel/setup.bash
+fi
+EOF
+  chmod 0644 /etc/profile.d/ros-drone.sh
+}
+
+# -----------------------------
+# Writes version in /etc/drone_version file
+# -----------------------------
+write_image_build_version() {
+  local v="${BUILD_VERSION:-}"
+  if [[ -z "$v" ]]; then
+    v="$(date +%Y%m%d_%H%M%S)"
+  fi
+  info "Write /etc/drone_version = ${v}"
+  echo "$v" > /etc/drone_version
+  chmod 0644 /etc/drone_version || true
 }
 
 # -----------------------------
@@ -1009,8 +1280,6 @@ apt_fix_sources_buster
 apt_update
 ensure_locales
 
-install_base_build_deps
-
 add_ros_and_coex_repos_like_clover
 apt_update
 
@@ -1018,10 +1287,25 @@ install_cmake_like_clover
 
 ensure_user_and_hostname
 install_extra_packages
+install_additional_software
 
 install_ros_if_needed
 install_ros_web_tools
+
+install_base_build_deps
+
+install_aruco_pose_like_clover
 build_drone_if_needed
+additional_ROS_packages
+
+# Make ROS tools available immediately after login (ssh/tty)
+setup_ros_shell_autosource
+
+# Install udev rules from the drone package (if present)
+setup_drone_udev_rules
+
+# Make rosrun drone selfcheck work (entrypoint inside package root)
+setup_drone_entrypoints
 
 enable_console_autologin
 setup_mdns_avahi
@@ -1032,15 +1316,21 @@ install_filebrowser_noauth
 setup_static_web_like_clover
 setup_roswww_static_update_service
 
-# ROS autostart services
 setup_rosbridge_service
 setup_drone_launch_service
-setup_web_video_server_service
+setup_web_video_server
 setup_butterfly_service
+
+# Reload systemd units (we wrote a bunch of them)
+systemctl daemon-reload 2>/dev/null || true
 
 info "Generate web pages now (best-effort)"
 su - "${PI_USER}" -c "/usr/local/sbin/drone-www-update.sh" || true
 systemctl restart nginx 2>/dev/null || true
+
+write_image_build_version
+
+sudo apt update
 
 cleanup
 ok "DONE"
