@@ -20,8 +20,7 @@ help:
 	@echo "  make middle      - собрать build/middle.img (тяжёлые пакеты/ROS/deps)"
 	@echo "  make final       - собрать финальный out/*.img.xz на основе middle.img"
 	@echo "  make build       - middle (если нужно) + final (полная сборка)"
-	@echo "  make build_drone - быстрый финал (то же что final)"
-	@echo "  make test        - smoke-test последнего out/*.img.xz"
+	@echo "  make test        - test последнего out/*.img.xz"
 	@echo "  make clean       - очистить build/*"
 
 deps:
@@ -42,11 +41,8 @@ final:
 build:
 	@sudo bash $(SCRIPTS)/build.sh $(ENV) $(CACHE) $(BUILD) $(OUT)
 
-build_drone:
-	@sudo bash $(SCRIPTS)/build_final.sh $(ENV) $(CACHE) $(BUILD) $(OUT)
-
 test:
-	@bash $(SCRIPTS)/smoke_test.sh $(OUT)
+	@bash $(SCRIPTS)/test.sh $(OUT)
 
 clean:
 	@sudo rm -rf $(BUILD)/*
