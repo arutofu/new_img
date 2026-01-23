@@ -1035,10 +1035,27 @@ EOF
 # ROS systemd services
 # -----------------------------
 write_ros_env_file() {
+  local ros_ip=""
+
+  if [[ "${ENABLE_WIFI_AP:-false}" == "true" && -n "${WIFI_AP_IP:-}" ]]; then
+    ros_ip="${WIFI_AP_IP}"
+  elif [[ -n "${ROS_IP_OVERRIDE:-}" ]]; then
+    ros_ip="${ROS_IP_OVERRIDE}"
+  else
+    ros_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+
   cat >/etc/default/ros <<EOF
 ROS_DISTRO=${ROS_DISTRO}
 ROS_MASTER_URI=http://localhost:11311
 EOF
+
+  if [[ -n "${ros_ip}" ]]; then
+    cat >>/etc/default/ros <<EOF
+ROS_IP=${ros_ip}
+ROS_HOSTNAME=${ros_ip}
+EOF
+  fi
 }
 
 setup_rosbridge_service() {
@@ -1092,6 +1109,8 @@ WorkingDirectory=${CATKIN_WS}
 ExecStart=/bin/bash -lc 'source /opt/ros/\${ROS_DISTRO}/setup.bash && [[ -f ${CATKIN_WS}/devel/setup.bash ]] && source ${CATKIN_WS}/devel/setup.bash; roslaunch drone drone.launch'
 Restart=on-failure
 RestartSec=2
+EnvironmentFile=-/etc/ros/env.conf
+ExecStartPre=/usr/local/sbin/ros-env-gen.sh
 
 [Install]
 WantedBy=multi-user.target
@@ -1186,6 +1205,85 @@ setup_drone_udev_rules() {
   else
     info "No udev rules dir found at ${udev_dir} -> skip"
   fi
+}
+
+# -----------------------------
+# Enable video
+# -----------------------------
+setup_rpi_video_modules() {
+  info "Setup RPi video modules (bcm2835-v4l2 / uvcvideo)"
+  mkdir -p /etc/modules-load.d
+
+  cat >/etc/modules-load.d/drone-video.conf <<'EOF'
+bcm2835-v4l2
+uvcvideo
+EOF
+
+  # На всякий случай: сразу подгрузим в чруте (не критично если не получится)
+  modprobe bcm2835-v4l2 2>/dev/null || true
+  modprobe uvcvideo 2>/dev/null || true
+
+  # Пользователь должен иметь доступ к /dev/video*
+  if id -u "${PI_USER:-pi}" >/dev/null 2>&1; then
+    usermod -aG video "${PI_USER:-pi}" || true
+  fi
+}
+
+# -----------------------------
+# Enable i2c
+# -----------------------------
+setup_rpi_i2c() {
+  info "Setup RPi I2C (boot config + i2c-dev module)"
+
+  # 1) Модуль i2c-dev
+  mkdir -p /etc/modules-load.d
+  cat >/etc/modules-load.d/drone-i2c.conf <<'EOF'
+i2c-dev
+EOF
+  modprobe i2c-dev 2>/dev/null || true
+
+  # 2) Включить I2C в /boot/config.txt (если /boot смонтирован в чруте)
+  if [[ -f /boot/config.txt ]]; then
+    grep -qE '^\s*dtparam=i2c_arm=on' /boot/config.txt || echo 'dtparam=i2c_arm=on' >>/boot/config.txt
+  else
+    warn "/boot/config.txt not found in chroot (boot partition may be not mounted here). I2C boot flag not set."
+  fi
+
+  # 3) Права пользователю на /dev/i2c-*
+  if id -u "${PI_USER:-pi}" >/dev/null 2>&1; then
+    usermod -aG i2c "${PI_USER:-pi}" || true
+  fi
+}
+
+# -----------------------------
+# ROS env
+# -----------------------------
+setup_ros_env_runtime() {
+  info "Setup runtime ROS env generator"
+
+  cat >/usr/local/sbin/ros-env-gen.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p /etc/ros
+
+pick_ip() {
+  local dev="$1"
+  ip -4 addr show "$dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -n1
+}
+
+IP="$(pick_ip wlan0 || true)"
+if [[ -z "${IP}" ]]; then IP="$(pick_ip eth0 || true)"; fi
+if [[ -z "${IP}" ]]; then IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"; fi
+
+cat >/etc/ros/env.conf <<EOT
+ROS_MASTER_URI=http://127.0.0.1:11311
+ROS_IP=${IP}
+ROS_HOSTNAME=${IP}
+EOT
+EOF
+
+  chmod +x /usr/local/sbin/ros-env-gen.sh
 }
 
 # -----------------------------
