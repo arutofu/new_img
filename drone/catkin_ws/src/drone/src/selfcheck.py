@@ -613,11 +613,10 @@ def check_simpleoffboard():
 
 @check('IMU')
 def check_imu():
-    msg = get_last_msg('/mavros/imu/data', sensor_msgs.msg.Imu, timeout=1.0)
-    if not msg:
-        failure('IMU: no IMU data (check flight controller calibration)')
-        return
-    info('IMU: OK')
+    try:
+        rospy.wait_for_message('mavros/imu/data', Imu, timeout=1)
+    except rospy.ROSException:
+        failure('no IMU data (check flight controller calibration)')
 
 @check('Local position')
 def check_local_position():
@@ -743,21 +742,27 @@ def check_optical_flow():
 
 @check('Rangefinder')
 def check_rangefinder():
-    # TODO: check FPS!
-    rng = False
-    try:
-        rospy.wait_for_message('rangefinder/range', Range, timeout=4)
-        rng = True
-    except rospy.ROSException:
-        failure('no rangefinder data from Raspberry')
+    # Consider rangefinder OK if at least one source publishes:
+    #  - /rangefinder/range (local RPi node)
+    #  - /mavros/distance_sensor/rangefinder (MAVROS distance_sensor)
+    sources = [
+        ('/rangefinder/range', 'from Raspberry'),
+        ('/mavros/distance_sensor/rangefinder', 'from FCU/MAVROS'),
+    ]
 
-    try:
-        rospy.wait_for_message('mavros/distance_sensor/rangefinder', Range, timeout=4)
-        rng = True
-    except rospy.ROSException:
+    ok = False
+    last_err = None
+    for topic, label in sources:
+        try:
+            rospy.wait_for_message(topic, Range, timeout=2.0)
+            info('Rangefinder: OK (%s)', label)
+            ok = True
+            break
+        except rospy.ROSException as e:
+            last_err = e
+
+    if not ok:
         failure('no rangefinder data')
-
-    if not rng:
         return
 
     ap = detect_autopilot_type()
@@ -767,14 +772,17 @@ def check_rangefinder():
             info('RNGFND1_TYPE = %s (hint: set to MAVLink to use MAVROS DISTANCE_SENSOR)', ff(rtype))
         else:
             info('RNGFND1_TYPE: unavailable')
+
         orient = get_param('RNGFND1_ORIENT', strict=False)
         if orient is not None:
             info('RNGFND1_ORIENT = %s', ff(orient))
+
         ek3rng = get_param('EK3_RNG_USE_HGT', strict=False)
         if ek3rng is not None:
             info('EK3_RNG_USE_HGT = %s', ff(ek3rng))
         return
 
+    # PX4 branches below (unchanged)
     est = get_param('SYS_MC_EST_GROUP')
     if est == 1:
         fuse = int(get_param('LPE_FUSION', 0))

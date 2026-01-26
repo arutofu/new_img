@@ -790,7 +790,19 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
            float lat, float lon, float thrust, float speed, string frame_id, bool auto_arm, // editorconfig-checker-disable-line
            uint8_t& success, string& message) // editorconfig-checker-disable-line
 {
-	auto stamp = ros::Time::now();
+	// auto stamp = ros::Time::now();
+
+	// время для публикации (setpoints, state)
+	ros::Time stamp_pub = ros::Time::now();
+
+	// время для TF (должно совпадать с тем, чем штампуется map->body)
+	ros::Time stamp_tf;
+	if (!local_position.header.stamp.isZero()) {
+		stamp_tf = local_position.header.stamp;
+	} else {
+		// если local_position ещё не пришёл — просим "latest"
+		stamp_tf = ros::Time(0);
+	}
 
 	try {
 		if (busy)
@@ -868,18 +880,21 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 		// if any value need to be transformed to reference frame
 		if (isfinite(x) || isfinite(y) || isfinite(z) || isfinite(vx) || isfinite(vy) || isfinite(vz) || isfinite(yaw)) {
 			// make sure transform from frame_id to reference frame available
-			if (!waitTransform(reference_frame, frame_id, stamp, transform_timeout))
+			//(reference_frame, frame_id, stamp, transform_timeout))
+			if (!waitTransform(reference_frame, frame_id, stamp_tf, transform_timeout))
 				throw std::runtime_error("Can't transform from " + frame_id + " to " + reference_frame);
 
 			// make sure transform from reference frame to local frame available
-			if (!waitTransform(local_frame, reference_frame, stamp, transform_timeout))
+			//if (!waitTransform(local_frame, reference_frame, stamp, transform_timeout))
+			if (!waitTransform(local_frame, reference_frame, stamp_tf, transform_timeout))
 				throw std::runtime_error("Can't transform from " + reference_frame + " to " + local_frame);
 		}
 
 		if (sp_type == NAVIGATE_GLOBAL) {
 			// Calculate x and from lat and lot in request's frame
 			auto pose_local = globalToLocal(lat, lon);
-			pose_local.header.stamp = stamp; // TODO: fix
+			//pose_local.header.stamp = stamp; // TODO: fix
+			pose_local.header.stamp = stamp_tf;
 			auto xy_in_req_frame = tf_buffer.transform(pose_local, frame_id);
 			x = xy_in_req_frame.pose.position.x;
 			y = xy_in_req_frame.pose.position.y;
@@ -926,7 +941,8 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 
 			PointStamped desired;
 			desired.header.frame_id = frame_id;
-			desired.header.stamp = stamp;
+			//desired.header.stamp = stamp;
+			desired.header.stamp = stamp_tf;
 			desired.point.x = safe(x);
 			desired.point.y = safe(y);
 			desired.point.z = safe(z);
@@ -957,7 +973,8 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 			// TODO: allow setting different modes by altitude and xy
 			Vector3Stamped desired;
 			desired.header.frame_id = frame_id;
-			desired.header.stamp = stamp;
+			//desired.header.stamp = stamp;
+			desired.header.stamp = stamp_tf;
 			desired.vector.x = safe(vx);
 			desired.vector.y = safe(vy);
 			desired.vector.z = safe(vz);
@@ -984,7 +1001,8 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 				setpoint_yaw_type = YAW;
 				QuaternionStamped desired;
 				desired.header.frame_id = frame_id;
-				desired.header.stamp = stamp;
+				//desired.header.stamp = stamp;
+				desired.header.stamp = stamp_tf;
 				desired.quaternion = tf::createQuaternionMsgFromYaw(yaw);
 
 				// transform to reference frame
@@ -1037,11 +1055,13 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 
 		wait_armed = auto_arm;
 
-		publish(stamp); // calculate initial transformed messages first
+		//publish(stamp); // calculate initial transformed messages first
+		publish(stamp_pub);
 		setpoint_timer.start();
 
 		if (setpoint_type == NAVIGATE || setpoint_type == NAVIGATE_GLOBAL || setpoint_type == POSITION) {
-			publishTarget(stamp, true);
+			//publishTarget(stamp, true);
+			publishTarget(stamp_pub, true);
 		}
 
 		publishState();

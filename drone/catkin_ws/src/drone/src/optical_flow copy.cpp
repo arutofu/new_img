@@ -31,8 +31,6 @@
 #include <geometry_msgs/TwistStamped.h>
 #include <drone/FlowConfig.h>
 
-#include <sensor_msgs/Range.h>
-
 using cv::Mat;
 
 class OpticalFlow : public nodelet::Nodelet
@@ -65,11 +63,6 @@ private:
 	ros::Time last_vpe_time_;
 	std::shared_ptr<dynamic_reconfigure::Server<drone::FlowConfig>> dyn_srv_;
 
-	// Rangefinder -> flow_.distance
-	ros::Subscriber range_sub_;
-	ros::Time last_range_stamp_;
-	float last_range_m_ = NAN;
-
 	void onInit()
 	{
 		ros::NodeHandle& nh = getNodeHandle();
@@ -92,14 +85,8 @@ private:
 		velo_pub_ = nh_priv.advertise<geometry_msgs::TwistStamped>("angular_velocity", 1);
 		shift_pub_ = nh_priv.advertise<geometry_msgs::Vector3Stamped>("shift", 1);
 
-		// Subscribe rangefinder to fill flow_.distance (required for ArduPilot FLOW_TYPE=5)
-		// Prefer local /rangefinder/range, because it's higher rate in your stack.
-		range_sub_ = nh.subscribe<sensor_msgs::Range>("rangefinder/range", 10, &OpticalFlow::rangeCallback, this);
-		// If you ever want MAVROS distance_sensor instead, use:
-		// range_sub_ = nh.subscribe<sensor_msgs::Range>("mavros/distance_sensor/rangefinder", 10, &OpticalFlow::rangeCallback, this);
-
 		flow_.time_delta_distance_us = 0;
-		flow_.distance = 0;   // will be updated from rangefinder; 0 means "unknown" if quality==0
+		flow_.distance = -1; // no distance sensor available
 		flow_.temperature = 0;
 
 		img_sub_ = it.subscribeCamera("image_raw", 1, &OpticalFlow::flow, this);
@@ -116,18 +103,6 @@ private:
 		dyn_srv_->setCallback(cb);
 
 		NODELET_INFO("Optical Flow initialized");
-	}
-
-	void rangeCallback(const sensor_msgs::Range::ConstPtr& msg)
-	{
-		// Accept only sane values; keep last good range in meters.
-		if (std::isfinite(msg->range) && msg->range > 0.05f && msg->range < 20.0f) {
-			last_range_m_ = msg->range;
-			last_range_stamp_ = msg->header.stamp;
-			if (last_range_stamp_.isZero()) {
-				last_range_stamp_ = ros::Time::now();
-			}
-		}
 	}
 
 	void parseCameraInfo(const sensor_msgs::CameraInfoConstPtr &cinfo) {
@@ -177,7 +152,7 @@ private:
 				std::vector<cv::Point2f> img_points;
 				cv::projectPoints(object_points, vec, vec, camera_matrix_, dist_coeffs_, img_points);
 
-				roi_ = cv::Rect(cv::Point2i(round(img_points[0].x), round(img_points[0].y)),
+				roi_ = cv::Rect(cv::Point2i(round(img_points[0].x), round(img_points[0].y)), 
 					cv::Point2i(round(img_points[1].x), round(img_points[1].y)));
 
 				ROS_INFO("ROI: %d %d - %d %d ", roi_.tl().x, roi_.tl().y, roi_.br().x, roi_.br().y);
@@ -245,73 +220,49 @@ private:
 
 			// Calculate integration time
 			ros::Duration integration_time = msg->header.stamp - prev_stamp_;
-			uint32_t integration_time_us = static_cast<uint32_t>(integration_time.toSec() * 1.0e6);
+			uint32_t integration_time_us = integration_time.toSec() * 1.0e6;
 
-			// Publish flow in fcu frame
-			flow_.header.stamp = msg->header.stamp;
-			flow_.integration_time_us = integration_time_us;
-			flow_.integrated_x = static_cast<float>(flow_fcu.vector.x);
-			flow_.integrated_y = static_cast<float>(flow_fcu.vector.y);
-
-			// Quality [0..255]
-			int q = static_cast<int>(response * 255.0);
-			if (q < 0) q = 0;
-			if (q > 255) q = 255;
-			flow_.quality = static_cast<uint8_t>(q);
-
-			// Fill distance from rangefinder (meters). If we don't have fresh range -> mark flow invalid.
-			bool have_range = std::isfinite(last_range_m_);
-			if (have_range) {
-				ros::Duration age = msg->header.stamp - last_range_stamp_;
-				if (age.toSec() > 0.5) { // stale
-					have_range = false;
-				}
-			}
-
-			if (have_range) {
-				flow_.distance = last_range_m_;
-				flow_.time_delta_distance_us = static_cast<uint32_t>((msg->header.stamp - last_range_stamp_).toSec() * 1.0e6);
-			} else {
-				flow_.distance = 0.0f;
-				flow_.time_delta_distance_us = 0;
-				flow_.quality = 0; // prevents ArduPilot from flagging/using bad data
-			}
-
-			// Calculate flow gyro (must NOT be NaN for ArduPilot)
-			// Default: zeros (safe). If calc_flow_gyro_ enabled and TF available -> use it.
-			flow_.integrated_xgyro = 0.0f;
-			flow_.integrated_ygyro = 0.0f;
-			flow_.integrated_zgyro = 0.0f;
+			// Calculate flow gyro
+			flow_.integrated_xgyro = flow_gyro_default_;
+			flow_.integrated_ygyro = flow_gyro_default_;
+			flow_.integrated_zgyro = flow_gyro_default_;
 
 			if (calc_flow_gyro_) {
 				try {
 					auto flow_gyro_camera = calcFlowGyro(msg->header.frame_id, prev_stamp_, msg->header.stamp);
 					geometry_msgs::Vector3Stamped flow_gyro_fcu;
 					tf_buffer_->transform(flow_gyro_camera, flow_gyro_fcu, fcu_frame_id_);
-					flow_.integrated_xgyro = static_cast<float>(flow_gyro_fcu.vector.x);
-					flow_.integrated_ygyro = static_cast<float>(flow_gyro_fcu.vector.y);
-					flow_.integrated_zgyro = static_cast<float>(flow_gyro_fcu.vector.z);
+					flow_.integrated_xgyro = flow_gyro_fcu.vector.x;
+					flow_.integrated_ygyro = flow_gyro_fcu.vector.y;
+					flow_.integrated_zgyro = flow_gyro_fcu.vector.z;
 				} catch (const tf2::TransformException& e) {
-					// Transform not available: keep zeros (NOT NaN)
+					// Transform not available, keep NANs in flow gyro
 				}
 			}
 
+			// Publish flow in fcu frame
+			flow_.header.stamp = /*prev_stamp_*/ msg->header.stamp;
+			flow_.integration_time_us = integration_time_us;
+			flow_.integrated_x = flow_fcu.vector.x;
+			flow_.integrated_y = flow_fcu.vector.y;
+			flow_.quality = (uint8_t)(response * 255);
 			flow_pub_.publish(flow_);
 
 			prev_ = curr_.clone();
 			prev_stamp_ = msg->header.stamp;
 
-			// Publish estimated angular velocity (debug/monitoring)
+			// Publish estimated angular velocity
 			geometry_msgs::TwistStamped velo;
 			velo.header.stamp = msg->header.stamp;
 			velo.header.frame_id = fcu_frame_id_;
-			velo.twist.angular.x = static_cast<double>(flow_fcu.vector.x) / integration_time.toSec();
-			velo.twist.angular.y = static_cast<double>(flow_fcu.vector.y) / integration_time.toSec();
+			velo.twist.angular.x = flow_fcu.vector.x / integration_time.toSec();
+			velo.twist.angular.y = flow_fcu.vector.y / integration_time.toSec();
 			velo_pub_.publish(velo);
 
 publish_debug:
 			// Publish debug image
 			if (img_pub_.getNumSubscribers() > 0) {
+				// publish debug image
 				drawFlow(img, shift_vec.vector.x, shift_vec.vector.y, response);
 				cv_bridge::CvImage out_msg;
 				out_msg.header.frame_id = msg->header.frame_id;

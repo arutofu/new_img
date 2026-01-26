@@ -1035,27 +1035,10 @@ EOF
 # ROS systemd services
 # -----------------------------
 write_ros_env_file() {
-  local ros_ip=""
-
-  if [[ "${ENABLE_WIFI_AP:-false}" == "true" && -n "${WIFI_AP_IP:-}" ]]; then
-    ros_ip="${WIFI_AP_IP}"
-  elif [[ -n "${ROS_IP_OVERRIDE:-}" ]]; then
-    ros_ip="${ROS_IP_OVERRIDE}"
-  else
-    ros_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  fi
-
   cat >/etc/default/ros <<EOF
 ROS_DISTRO=${ROS_DISTRO}
-ROS_MASTER_URI=http://localhost:11311
+ROS_MASTER_URI=http://127.0.0.1:11311
 EOF
-
-  if [[ -n "${ros_ip}" ]]; then
-    cat >>/etc/default/ros <<EOF
-ROS_IP=${ros_ip}
-ROS_HOSTNAME=${ros_ip}
-EOF
-  fi
 }
 
 setup_rosbridge_service() {
@@ -1097,20 +1080,20 @@ setup_drone_launch_service() {
   cat >/etc/systemd/system/drone.service <<EOF
 [Unit]
 Description=Drone main ROS launch
-After=network-online.target
+After=network-online.target ros-env-gen.service
 Wants=network-online.target
+Requires=ros-env-gen.service
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/default/ros
-User=${PI_USER}
-Group=${PI_USER}
-WorkingDirectory=${CATKIN_WS}
-ExecStart=/bin/bash -lc 'source /opt/ros/\${ROS_DISTRO}/setup.bash && [[ -f ${CATKIN_WS}/devel/setup.bash ]] && source ${CATKIN_WS}/devel/setup.bash; roslaunch drone drone.launch'
+EnvironmentFile=-/run/ros/env.conf
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/catkin_ws
+ExecStart=/bin/bash -lc 'source /opt/ros/${ROS_DISTRO}/setup.bash && [[ -f /home/pi/catkin_ws/devel/setup.bash ]] && source /home/pi/catkin_ws/devel/setup.bash; roslaunch drone drone.launch'
 Restart=on-failure
 RestartSec=2
-EnvironmentFile=-/etc/ros/env.conf
-ExecStartPre=/usr/local/sbin/ros-env-gen.sh
 
 [Install]
 WantedBy=multi-user.target
@@ -1227,6 +1210,41 @@ EOF
   if id -u "${PI_USER:-pi}" >/dev/null 2>&1; then
     usermod -aG video "${PI_USER:-pi}" || true
   fi
+
+# -----------------------------
+# Enable CSI camera (legacy stack)
+# -----------------------------
+  info "Enable RPi legacy CSI camera in /boot/config.txt (start_x=1, gpu_mem=128)"
+
+  local CFG="/boot/config.txt"
+  if [[ ! -f "$CFG" ]]; then
+    warn "No $CFG (is /boot mounted in image?). Skipping camera enable."
+    return 0
+  fi
+
+  ensure_kv() {
+    local key="$1"
+    local val="$2"
+    local line="${key}=${val}"
+
+    # Если строка закомментирована (#start_x=0) — раскомментировать и заменить
+    if grep -Eq "^[#;][[:space:]]*${key}=" "$CFG"; then
+      sed -i -E "s|^[#;][[:space:]]*${key}=.*|${line}|g" "$CFG"
+      return
+    fi
+
+    # Если есть активная — заменить
+    if grep -Eq "^${key}=" "$CFG"; then
+      sed -i -E "s|^${key}=.*|${line}|g" "$CFG"
+      return
+    fi
+
+    # Иначе добавить
+    echo "$line" >>"$CFG"
+  }
+
+  ensure_kv "start_x" "1"
+  ensure_kv "gpu_mem" "128"
 }
 
 # -----------------------------
@@ -1259,24 +1277,59 @@ EOF
 # ROS env
 # -----------------------------
 setup_ros_env_runtime() {
-  info "Setup runtime ROS env generator"
+  info "Setup runtime ROS env generator + systemd service"
 
   cat >/usr/local/sbin/ros-env-gen.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p /etc/ros
+install -d -m 0755 /run/ros
 
 pick_ip() {
   local dev="$1"
   ip -4 addr show "$dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -n1
 }
 
+sync_time_if_needed() {
+  # Если время уже норм — ничего не делаем
+  local y
+  y="$(date +%Y 2>/dev/null || echo 1970)"
+  if [[ "$y" -ge 2024 ]]; then
+    return 0
+  fi
+
+  # Пытаемся взять время из интернета (HTTP Date header)
+  # Важно: нужна сеть; если сети нет — просто продолжим без фейла
+  for url in \
+    "https://google.com" \
+    "https://cloudflare.com" \
+    "https://www.wikipedia.org" \
+    "https://www.ya.ru"
+  do
+    # Date: Mon, 26 Jan 2026 06:30:54 GMT
+    hdr_date="$(curl -fsSI --max-time 3 "$url" 2>/dev/null | awk -F': ' 'tolower($1)=="date"{print $2; exit}')"
+    if [[ -n "${hdr_date:-}" ]]; then
+      # выставляем UTC
+      if date -u -s "$hdr_date" >/dev/null 2>&1; then
+        echo "[ros-env-gen] time synced from $url: $hdr_date"
+        return 0
+      fi
+    fi
+  done
+
+  echo "[ros-env-gen] WARN: cannot sync time from internet (no network?)"
+  return 0
+}
+
+sync_time_if_needed
+
 IP="$(pick_ip wlan0 || true)"
 if [[ -z "${IP}" ]]; then IP="$(pick_ip eth0 || true)"; fi
 if [[ -z "${IP}" ]]; then IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"; fi
+# КРИТИЧНО: если сети ещё нет — не ломаем старт ROS
+if [[ -z "${IP}" ]]; then IP="127.0.0.1"; fi
 
-cat >/etc/ros/env.conf <<EOT
+cat >/run/ros/env.conf <<EOT
 ROS_MASTER_URI=http://127.0.0.1:11311
 ROS_IP=${IP}
 ROS_HOSTNAME=${IP}
@@ -1284,7 +1337,25 @@ EOT
 EOF
 
   chmod +x /usr/local/sbin/ros-env-gen.sh
+
+  # systemd unit (то, чего сейчас не хватает!)
+  cat >/etc/systemd/system/ros-env-gen.service <<'EOF'
+[Unit]
+Description=Generate runtime ROS env (/run/ros/env.conf)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ros-env-gen.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl enable ros-env-gen.service 2>/dev/null || true
 }
+
 
 # -----------------------------
 # Make `rosrun drone selfcheck` work (package-level entrypoint)
