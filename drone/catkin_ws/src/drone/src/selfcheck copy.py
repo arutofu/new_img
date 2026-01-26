@@ -604,20 +604,14 @@ def check_simpleoffboard():
         failure('no simple_offboard services')
 
 
-# @check('IMU')
-# def check_imu():
-#     try:
-#         rospy.wait_for_message('mavros/imu/data', Imu, timeout=1)
-#     except rospy.ROSException:
-#         failure('no IMU data (check flight controller calibration)')
-
 @check('IMU')
 def check_imu():
-    msg = get_last_msg('/mavros/imu/data', sensor_msgs.msg.Imu, timeout=1.0)
-    if not msg:
-        failure('IMU: no IMU data (check flight controller calibration)')
-        return
-    info('IMU: OK')
+    try:
+        rospy.wait_for_message('mavros/imu/data', Imu, timeout=1)
+    except rospy.ROSException:
+        failure('no IMU data (check flight controller calibration)')
+
+
 
 @check('Local position')
 def check_local_position():
@@ -892,11 +886,7 @@ def check_image():
         except IOError:
             info('no /etc/drone_version file')
 
-@check('Kernel version')
-def check_kernel():
-    output = subprocess.check_output(['uname', '-a'])
-    output = output.decode('utf-8').strip()
-    info('Kernel: %s', output)
+
 
 @check('Preflight status')
 def check_preflight_status():
@@ -962,38 +952,31 @@ def check_preflight_status():
                 failure(' '.join([match.groups()[1], 'check:', check_status]))
 
 
-# @check('Network')
-# def check_network():
-#     if not os.path.exists('/etc/drone_version'):
-#         # TODO:
-#         return
-
-#     ros_hostname = os.environ.get('ROS_HOSTNAME', '').strip()
-
-#     if not ros_hostname:
-#         failure('no ROS_HOSTNAME is set')
-
-#     elif ros_hostname.endswith('.local'):
-#         # using mdns hostname
-#         hosts = open('/etc/hosts', 'r')
-#         for line in hosts:
-#             parts = line.split()
-#             if len(parts) < 2:
-#                 continue
-#             ip = parts.pop(0).split('.')
-#             if ip[0] == '127':  # loopback ip
-#                 if ros_hostname in parts:
-#                     break
-#         else:
-#             failure('not found %s in /etc/hosts, ROS will malfunction if network interfaces are down', ros_hostname)
-
+@check('Network')
 def check_network():
-    hostname = os.getenv('ROS_HOSTNAME')
-    ros_ip = os.getenv('ROS_IP')
-    if not hostname and not ros_ip:
-        failure('Network: no ROS_HOSTNAME is set')
-    else:
-        info('Network: OK')
+    if not os.path.exists('/etc/drone_version'):
+        # TODO:
+        return
+
+    ros_hostname = os.environ.get('ROS_HOSTNAME', '').strip()
+
+    if not ros_hostname:
+        failure('no ROS_HOSTNAME is set')
+
+    elif ros_hostname.endswith('.local'):
+        # using mdns hostname
+        hosts = open('/etc/hosts', 'r')
+        for line in hosts:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            ip = parts.pop(0).split('.')
+            if ip[0] == '127':  # loopback ip
+                if ros_hostname in parts:
+                    break
+        else:
+            failure('not found %s in /etc/hosts, ROS will malfunction if network interfaces are down', ros_hostname)
+
 
 @check('RPi health')
 def check_rpi_health():
@@ -1046,10 +1029,10 @@ def check_rpi_health():
 
 @check('Board')
 def check_board():
-    output = subprocess.check_output(['cat', '/proc/device-tree/model'])
-    output = output.decode('utf-8')
-    output = output.strip('\0')
-    info('Board: %s', output)
+    try:
+        info('%s', open('/proc/device-tree/model').readline())
+    except IOError:
+        info('could not open /proc/device-tree/model, not a Raspberry Pi?')
 
 
 def parallel_for(fns):
@@ -1070,7 +1053,6 @@ def consequentially_for(fns):
 def selfcheck():
     checks = [
         check_image,
-        check_kernel,
         check_board,
         check_drone_service,
         check_network,

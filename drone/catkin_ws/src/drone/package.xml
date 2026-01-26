@@ -32,6 +32,7 @@
   <depend>nodelet</depend>
   <depend>mavros</depend>
   <depend>mavros_extras</depend>
+  <exec_depend>mavros_msgs</exec_depend>
   <depend>cv_camera</depend>
   <depend>cv_bridge</depend>
   <depend>rosbridge_server</depend>

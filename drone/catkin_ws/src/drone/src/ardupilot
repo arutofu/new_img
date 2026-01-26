@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import time
+import rospy
+from mavros_msgs.msg import State, StatusText
+from mavros_msgs.srv import MessageInterval, MessageIntervalRequest
+
+# MAVLink message IDs
+MAVLINK_MSG = {
+    "ATTITUDE": 30,        # /mavros/imu/data often depends on attitude stream
+    "RAW_IMU": 27,         # /mavros/imu/data_raw
+    "HIGHRES_IMU": 105,    # good IMU source
+    "RC_CHANNELS": 65,     # /mavros/rc/in
+    "STATUSTEXT": 253,     # /mavros/statustext/recv
+}
+
+PX4_HINTS = ("PX4", "PX4IO", "FMU")
+ARDU_HINTS = ("Ardu", "ArduCopter", "ArduPilot")
+
+class ArduPilotAdapter:
+    def __init__(self):
+        self.state = None
+        self.last_statustext = ""
+        self.detected = None  # "px4" | "ardupilot" | None
+
+        rospy.Subscriber("/mavros/state", State, self._cb_state, queue_size=10)
+        rospy.Subscriber("/mavros/statustext/recv", StatusText, self._cb_statustext, queue_size=50)
+
+    def _cb_state(self, msg: State):
+        self.state = msg
+
+    def _cb_statustext(self, msg: StatusText):
+        self.last_statustext = msg.text or ""
+        t = self.last_statustext
+        if any(h in t for h in PX4_HINTS):
+            self.detected = "px4"
+        if any(h in t for h in ARDU_HINTS):
+            self.detected = "ardupilot"
+
+    def wait_connected(self, timeout_s=30.0):
+        t0 = time.time()
+        rate = rospy.Rate(10)
+        while not rospy.is_shutdown():
+            if self.state and self.state.connected:
+                return True
+            if time.time() - t0 > timeout_s:
+                return False
+            rate.sleep()
+
+    def detect_autopilot(self, timeout_s=15.0):
+        """
+        Tries:
+          1) STATUSTEXT keywords (best)
+          2) fallback by mode name
+        """
+        t0 = time.time()
+        rate = rospy.Rate(10)
+        while not rospy.is_shutdown() and time.time() - t0 < timeout_s:
+            if self.detected in ("px4", "ardupilot"):
+                return self.detected
+            rate.sleep()
+
+        # Fallback: mode heuristics
+        if self.state:
+            m = (self.state.mode or "").upper()
+            if m in ("OFFBOARD", "POSCTL", "ALTCTL") or "AUTO" in m and "MISSION" in m:
+                return "px4"
+            if m in ("STABILIZE", "ALT_HOLD", "LOITER", "GUIDED", "AUTO"):
+                return "ardupilot"
+
+        return None
+
+    def set_interval(self, srv, message_id: int, rate_hz: float):
+        req = MessageIntervalRequest()
+        req.message_id = int(message_id)
+        req.message_rate = float(rate_hz)
+        try:
+            resp = srv(req)
+            return bool(resp.success)
+        except Exception as e:
+            rospy.logwarn("set_message_interval failed for msg_id=%s: %s", message_id, e)
+            return False
+
+    def run(self):
+        # Idempotency guard (чтобы не дергать FCU бесконечно)
+        if rospy.get_param("/drone/ardupilot_adapter_applied", False):
+            rospy.loginfo("Already applied earlier (/drone/ardupilot_adapter_applied=true). Exit.")
+            return
+
+        if not self.wait_connected(timeout_s=30.0):
+            rospy.logwarn("MAVROS not connected in time. Exit.")
+            return
+
+        ap = self.detect_autopilot(timeout_s=15.0)
+        if ap == "px4":
+            rospy.loginfo("Detected PX4 -> do nothing, exit.")
+            return
+        if ap != "ardupilot":
+            rospy.logwarn("Autopilot not detected -> assume ArduPilot? NO. Exit to be safe.")
+            return
+
+        rospy.loginfo("Detected ArduPilot -> applying message intervals...")
+
+        rospy.wait_for_service("/mavros/set_message_interval", timeout=10.0)
+        srv = rospy.ServiceProxy("/mavros/set_message_interval", MessageInterval)
+
+        # То, что реально “оживляло” у тебя:
+        ok1 = self.set_interval(srv, MAVLINK_MSG["HIGHRES_IMU"], 50.0)
+        ok2 = self.set_interval(srv, MAVLINK_MSG["RAW_IMU"], 50.0)
+        ok3 = self.set_interval(srv, MAVLINK_MSG["ATTITUDE"], 20.0)
+
+        # Дополнительно полезно (RC + статусы) — можно оставить:
+        ok4 = self.set_interval(srv, MAVLINK_MSG["RC_CHANNELS"], 20.0)
+        ok5 = self.set_interval(srv, MAVLINK_MSG["STATUSTEXT"], 5.0)
+
+        rospy.set_param("/drone/ardupilot_adapter_applied", True)
+
+        rospy.loginfo(
+            "Applied: HIGHRES_IMU=%s RAW_IMU=%s ATTITUDE=%s RC_CHANNELS=%s STATUSTEXT=%s",
+            ok1, ok2, ok3, ok4, ok5
+        )
+
+        # Можно сразу проверить, что пошли топики (опционально):
+        time.sleep(1.0)
+
+
+def main():
+    rospy.init_node("ardupilot_adapter", anonymous=False)
+    ArduPilotAdapter().run()
+
+if __name__ == "__main__":
+    main()
