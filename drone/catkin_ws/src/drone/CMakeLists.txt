@@ -157,7 +157,7 @@ catkin_package(
 ## Specify additional locations of header files
 ## Your package locations should be listed before other locations
 include_directories(
-# include
+  include
   ${catkin_INCLUDE_DIRS}
   ${GeographicLib_INCLUDE_DIRS}
 )
@@ -268,6 +268,11 @@ shell drone
 #   # myfile2
 #   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 # )
+
+catkin_install_python(PROGRAMS
+  src/ardupilot
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
 
 catkin_install_python(PROGRAMS src/selfcheck.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

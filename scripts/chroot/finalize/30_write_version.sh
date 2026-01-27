@@ -1,0 +1,1 @@
+write_image_build_version

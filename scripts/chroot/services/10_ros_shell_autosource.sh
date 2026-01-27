@@ -1,0 +1,1 @@
+setup_ros_shell_autosource

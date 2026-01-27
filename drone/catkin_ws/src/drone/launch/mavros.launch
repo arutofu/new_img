@@ -53,6 +53,7 @@
             - imu
             - local_position
             - manual_control
+            - odometry 
             # - mocap_pose_estimate
             - param
             - px4flow

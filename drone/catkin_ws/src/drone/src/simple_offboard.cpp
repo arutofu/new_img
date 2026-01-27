@@ -53,6 +53,9 @@
 #include <drone/SetRates.h>
 #include <drone/State.h>
 
+#include <mavros_msgs/ParamGet.h>
+#include <drone/autopilot_type.h>
+
 using std::string;
 using std::isnan;
 using namespace geometry_msgs;
@@ -119,6 +122,17 @@ bool busy = false;
 bool wait_armed = false;
 bool nav_from_sp_flag = false;
 
+// Autopilot runtime mode mapping
+AutopilotType g_ap_type = AutopilotType::UNKNOWN;
+
+// Which mode we require for "offboard-like" control
+std::string g_nav_mode = "OFFBOARD";   // PX4 default
+std::string g_land_mode = "AUTO.LAND"; // PX4 default
+
+inline bool isNavControlMode(const std::string& mode) {
+	return mode == g_nav_mode;
+}
+
 // Last published
 PoseStamped setpoint_pose_local;
 Vector3Stamped setpoint_velocity_local;
@@ -157,11 +171,21 @@ void handleMessage(const T& msg)
 	STORAGE = msg;
 }
 
+// void handleState(const mavros_msgs::State& s)
+// {
+// 	state = s;
+// 	if (s.mode != "OFFBOARD") {
+// 		// flight intercepted
+// 		nav_from_sp_flag = false;
+// 	}
+// }
+
 void handleState(const mavros_msgs::State& s)
 {
 	state = s;
-	if (s.mode != "OFFBOARD") {
-		// flight intercepted
+
+	// If FCU left our control mode -> stop nav_from_sp behavior
+	if (!isNavControlMode(s.mode)) {
 		nav_from_sp_flag = false;
 	}
 }
@@ -318,47 +342,108 @@ bool getTelemetry(GetTelemetry::Request& req, GetTelemetry::Response& res)
 }
 
 // throws std::runtime_error
+// void offboardAndArm()
+// {
+// 	ros::Rate r(10);
+
+// 	if (state.mode != "OFFBOARD") {
+// 		auto start = ros::Time::now();
+// 		ROS_INFO("switch to OFFBOARD");
+// 		static mavros_msgs::SetMode sm;
+// 		sm.request.custom_mode = "OFFBOARD";
+
+// 		if (!set_mode.call(sm))
+// 			throw std::runtime_error("Error calling set_mode service");
+
+// 		// wait for OFFBOARD mode
+// 		while (ros::ok()) {
+// 			ros::spinOnce();
+// 			if (state.mode == "OFFBOARD") {
+// 				break;
+// 			} else if (ros::Time::now() - start > offboard_timeout) {
+// 				string report = "OFFBOARD timed out";
+// 				if (statustext.header.stamp > start)
+// 					report += ": " + statustext.text;
+// 				throw std::runtime_error(report);
+// 			}
+// 			ros::spinOnce();
+// 			r.sleep();
+// 		}
+// 	}
+
+// 	if (!state.armed) {
+// 		ros::Time start = ros::Time::now();
+// 		ROS_INFO("arming");
+// 		mavros_msgs::CommandBool srv;
+// 		srv.request.value = true;
+// 		if (!arming.call(srv)) {
+// 			throw std::runtime_error("Error calling arming service");
+// 		}
+
+// 		// wait until armed
+// 		while (ros::ok()) {
+// 			ros::spinOnce();
+// 			if (state.armed) {
+// 				break;
+// 			} else if (ros::Time::now() - start > arming_timeout) {
+// 				string report = "Arming timed out";
+// 				if (statustext.header.stamp > start)
+// 					report += ": " + statustext.text;
+// 				throw std::runtime_error(report);
+// 			}
+// 			ros::spinOnce();
+// 			r.sleep();
+// 		}
+// 	}
+// }
+
+// throws std::runtime_error
 void offboardAndArm()
 {
 	ros::Rate r(10);
 
-	if (state.mode != "OFFBOARD") {
+	// Switch to control mode (PX4: OFFBOARD, ArduPilot: GUIDED/GUIDED_NOGPS)
+	if (!isNavControlMode(state.mode)) {
 		auto start = ros::Time::now();
-		ROS_INFO("switch to OFFBOARD");
-		static mavros_msgs::SetMode sm;
-		sm.request.custom_mode = "OFFBOARD";
+		ROS_INFO("switch to %s", g_nav_mode.c_str());
+
+		mavros_msgs::SetMode sm;
+		sm.request.custom_mode = g_nav_mode;
 
 		if (!set_mode.call(sm))
 			throw std::runtime_error("Error calling set_mode service");
 
-		// wait for OFFBOARD mode
+		// wait for target mode
 		while (ros::ok()) {
 			ros::spinOnce();
-			if (state.mode == "OFFBOARD") {
+
+			if (isNavControlMode(state.mode)) {
 				break;
 			} else if (ros::Time::now() - start > offboard_timeout) {
-				string report = "OFFBOARD timed out";
+				string report = g_nav_mode + " timed out";
 				if (statustext.header.stamp > start)
 					report += ": " + statustext.text;
 				throw std::runtime_error(report);
 			}
-			ros::spinOnce();
+
 			r.sleep();
 		}
 	}
 
+	// Arm
 	if (!state.armed) {
 		ros::Time start = ros::Time::now();
 		ROS_INFO("arming");
+
 		mavros_msgs::CommandBool srv;
 		srv.request.value = true;
-		if (!arming.call(srv)) {
+		if (!arming.call(srv))
 			throw std::runtime_error("Error calling arming service");
-		}
 
 		// wait until armed
 		while (ros::ok()) {
 			ros::spinOnce();
+
 			if (state.armed) {
 				break;
 			} else if (ros::Time::now() - start > arming_timeout) {
@@ -367,11 +452,12 @@ void offboardAndArm()
 					report += ": " + statustext.text;
 				throw std::runtime_error(report);
 			}
-			ros::spinOnce();
+
 			r.sleep();
 		}
 	}
 }
+
 
 inline double hypot(double x, double y, double z)
 {
@@ -704,7 +790,19 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
            float lat, float lon, float thrust, float speed, string frame_id, bool auto_arm, // editorconfig-checker-disable-line
            uint8_t& success, string& message) // editorconfig-checker-disable-line
 {
-	auto stamp = ros::Time::now();
+	// auto stamp = ros::Time::now();
+
+	// время для публикации (setpoints, state)
+	ros::Time stamp_pub = ros::Time::now();
+
+	// время для TF (должно совпадать с тем, чем штампуется map->body)
+	ros::Time stamp_tf;
+	if (!local_position.header.stamp.isZero()) {
+		stamp_tf = local_position.header.stamp;
+	} else {
+		// если local_position ещё не пришёл — просим "latest"
+		stamp_tf = ros::Time(0);
+	}
 
 	try {
 		if (busy)
@@ -782,18 +880,21 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 		// if any value need to be transformed to reference frame
 		if (isfinite(x) || isfinite(y) || isfinite(z) || isfinite(vx) || isfinite(vy) || isfinite(vz) || isfinite(yaw)) {
 			// make sure transform from frame_id to reference frame available
-			if (!waitTransform(reference_frame, frame_id, stamp, transform_timeout))
+			//(reference_frame, frame_id, stamp, transform_timeout))
+			if (!waitTransform(reference_frame, frame_id, stamp_tf, transform_timeout))
 				throw std::runtime_error("Can't transform from " + frame_id + " to " + reference_frame);
 
 			// make sure transform from reference frame to local frame available
-			if (!waitTransform(local_frame, reference_frame, stamp, transform_timeout))
+			//if (!waitTransform(local_frame, reference_frame, stamp, transform_timeout))
+			if (!waitTransform(local_frame, reference_frame, stamp_tf, transform_timeout))
 				throw std::runtime_error("Can't transform from " + reference_frame + " to " + local_frame);
 		}
 
 		if (sp_type == NAVIGATE_GLOBAL) {
 			// Calculate x and from lat and lot in request's frame
 			auto pose_local = globalToLocal(lat, lon);
-			pose_local.header.stamp = stamp; // TODO: fix
+			//pose_local.header.stamp = stamp; // TODO: fix
+			pose_local.header.stamp = stamp_tf;
 			auto xy_in_req_frame = tf_buffer.transform(pose_local, frame_id);
 			x = xy_in_req_frame.pose.position.x;
 			y = xy_in_req_frame.pose.position.y;
@@ -810,7 +911,8 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 			nav_from_sp_flag = false;
 		}
 
-		bool to_auto_arm = auto_arm && (state.mode != "OFFBOARD" || !state.armed);
+		//bool to_auto_arm = auto_arm && (state.mode != "OFFBOARD" || !state.armed);
+		bool to_auto_arm = auto_arm && (!isNavControlMode(state.mode) || !state.armed);
 		if (to_auto_arm || setpoint_type == VELOCITY || setpoint_type == ATTITUDE || setpoint_type == RATES) {
 			// invalidate position setpoint
 			setpoint_position.header.frame_id = "";
@@ -839,7 +941,8 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 
 			PointStamped desired;
 			desired.header.frame_id = frame_id;
-			desired.header.stamp = stamp;
+			//desired.header.stamp = stamp;
+			desired.header.stamp = stamp_tf;
 			desired.point.x = safe(x);
 			desired.point.y = safe(y);
 			desired.point.z = safe(z);
@@ -870,7 +973,8 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 			// TODO: allow setting different modes by altitude and xy
 			Vector3Stamped desired;
 			desired.header.frame_id = frame_id;
-			desired.header.stamp = stamp;
+			//desired.header.stamp = stamp;
+			desired.header.stamp = stamp_tf;
 			desired.vector.x = safe(vx);
 			desired.vector.y = safe(vy);
 			desired.vector.z = safe(vz);
@@ -897,7 +1001,8 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 				setpoint_yaw_type = YAW;
 				QuaternionStamped desired;
 				desired.header.frame_id = frame_id;
-				desired.header.stamp = stamp;
+				//desired.header.stamp = stamp;
+				desired.header.stamp = stamp_tf;
 				desired.quaternion = tf::createQuaternionMsgFromYaw(yaw);
 
 				// transform to reference frame
@@ -950,11 +1055,13 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 
 		wait_armed = auto_arm;
 
-		publish(stamp); // calculate initial transformed messages first
+		//publish(stamp); // calculate initial transformed messages first
+		publish(stamp_pub);
 		setpoint_timer.start();
 
 		if (setpoint_type == NAVIGATE || setpoint_type == NAVIGATE_GLOBAL || setpoint_type == POSITION) {
-			publishTarget(stamp, true);
+			//publishTarget(stamp, true);
+			publishTarget(stamp_pub, true);
 		}
 
 		publishState();
@@ -962,10 +1069,14 @@ bool serve(enum setpoint_type_t sp_type, float x, float y, float z, float vx, fl
 		if (auto_arm) {
 			offboardAndArm();
 			wait_armed = false;
-		} else if (state.mode != "OFFBOARD") {
-			setpoint_timer.stop();
-			throw std::runtime_error("Copter is not in OFFBOARD mode, use auto_arm?");
-		} else if (!state.armed) {
+// 		} else if (state.mode != "OFFBOARD") {
+// 			setpoint_timer.stop();
+// 			throw std::runtime_error("Copter is not in OFFBOARD mode, use auto_arm?");
+// 		} else if (!state.armed) {
+        } else if (!isNavControlMode(state.mode)) {
+        	setpoint_timer.stop();
+        	throw std::runtime_error("Copter is not in " + g_nav_mode + " mode, use auto_arm?");
+        } else if (!state.armed) {
 			setpoint_timer.stop();
 			throw std::runtime_error("Copter is not armed, use auto_arm?");
 		}
@@ -1028,14 +1139,21 @@ bool land(std_srvs::Trigger::Request& req, std_srvs::Trigger::Response& res)
 
 		checkState();
 
-		if (land_only_in_offboard) {
-			if (state.mode != "OFFBOARD") {
-				throw std::runtime_error("Copter is not in OFFBOARD mode");
-			}
-		}
+// 		if (land_only_in_offboard) {
+// 			if (state.mode != "OFFBOARD") {
+// 				throw std::runtime_error("Copter is not in OFFBOARD mode");
+// 			}
+// 		}
+        if (land_only_in_offboard) {
+        	if (!isNavControlMode(state.mode)) {
+        		throw std::runtime_error("Copter is not in " + g_nav_mode + " mode");
+        	}
+        }
 
-		static mavros_msgs::SetMode sm;
-		sm.request.custom_mode = "AUTO.LAND";
+// 		static mavros_msgs::SetMode sm;
+// 		sm.request.custom_mode = "AUTO.LAND";
+        mavros_msgs::SetMode sm;
+        sm.request.custom_mode = g_land_mode;
 
 		if (!set_mode.call(sm))
 			throw std::runtime_error("Can't call set_mode service");
@@ -1046,11 +1164,15 @@ bool land(std_srvs::Trigger::Request& req, std_srvs::Trigger::Response& res)
 		static ros::Rate r(10);
 		auto start = ros::Time::now();
 		while (ros::ok()) {
-			if (state.mode == "AUTO.LAND") {
-				break;
-			}
+// 			if (state.mode == "AUTO.LAND") {
+// 				break;
+// 			}
+            if (state.mode == g_land_mode) {
+            	break;
+            }
 			if (ros::Time::now() - start > land_timeout)
-				throw std::runtime_error("Land request timed out");
+				// throw std::runtime_error("Land request timed out");
+				throw std::runtime_error("Land (" + g_land_mode + ") request timed out");
 
 			ros::spinOnce();
 			r.sleep();
@@ -1093,6 +1215,23 @@ int main(int argc, char **argv)
 {
 	ros::init(argc, argv, "simple_offboard");
 	ros::NodeHandle nh, nh_priv("~");
+	
+	// Detect autopilot
+    g_ap_type = detectAutopilot(nh);
+    ROS_WARN_STREAM("[simple_offboard] Autopilot detected: " << autopilotName(g_ap_type));
+    
+    // Set mode mapping
+    if (g_ap_type == AutopilotType::ARDUPILOT) {
+    	// If you run without GPS and rely on external nav (VIO/flow), you may need GUIDED_NOGPS.
+    	// Start with GUIDED, switch to GUIDED_NOGPS only if ArduPilot refuses GUIDED.
+    	g_nav_mode = nh_priv.param<std::string>("ap_nav_mode", "GUIDED");
+    	g_land_mode = nh_priv.param<std::string>("ap_land_mode", "LAND");
+    } else {
+    	// PX4 defaults
+    	g_nav_mode = nh_priv.param<std::string>("ap_nav_mode", "OFFBOARD");
+    	g_land_mode = nh_priv.param<std::string>("ap_land_mode", "AUTO.LAND");
+    }
+    ROS_WARN("[simple_offboard] nav_mode=%s land_mode=%s", g_nav_mode.c_str(), g_land_mode.c_str());
 
 	tf2_ros::TransformListener tf_listener(tf_buffer);
 	transform_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>();

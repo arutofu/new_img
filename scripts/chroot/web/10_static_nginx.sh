@@ -1,0 +1,1 @@
+setup_static_web_like_clover

@@ -604,19 +604,14 @@ def check_simpleoffboard():
         failure('no simple_offboard services')
 
 
-# @check('IMU')
-# def check_imu():
-#     try:
-#         rospy.wait_for_message('mavros/imu/data', Imu, timeout=1)
-#     except rospy.ROSException:
-#         failure('no IMU data (check flight controller calibration)')
-
 @check('IMU')
 def check_imu():
     try:
         rospy.wait_for_message('mavros/imu/data', Imu, timeout=1)
     except rospy.ROSException:
         failure('no IMU data (check flight controller calibration)')
+
+
 
 @check('Local position')
 def check_local_position():
@@ -742,27 +737,21 @@ def check_optical_flow():
 
 @check('Rangefinder')
 def check_rangefinder():
-    # Consider rangefinder OK if at least one source publishes:
-    #  - /rangefinder/range (local RPi node)
-    #  - /mavros/distance_sensor/rangefinder (MAVROS distance_sensor)
-    sources = [
-        ('/rangefinder/range', 'from Raspberry'),
-        ('/mavros/distance_sensor/rangefinder', 'from FCU/MAVROS'),
-    ]
+    # TODO: check FPS!
+    rng = False
+    try:
+        rospy.wait_for_message('rangefinder/range', Range, timeout=4)
+        rng = True
+    except rospy.ROSException:
+        failure('no rangefinder data from Raspberry')
 
-    ok = False
-    last_err = None
-    for topic, label in sources:
-        try:
-            rospy.wait_for_message(topic, Range, timeout=2.0)
-            info('Rangefinder: OK (%s)', label)
-            ok = True
-            break
-        except rospy.ROSException as e:
-            last_err = e
-
-    if not ok:
+    try:
+        rospy.wait_for_message('mavros/distance_sensor/rangefinder', Range, timeout=4)
+        rng = True
+    except rospy.ROSException:
         failure('no rangefinder data')
+
+    if not rng:
         return
 
     ap = detect_autopilot_type()
@@ -772,17 +761,14 @@ def check_rangefinder():
             info('RNGFND1_TYPE = %s (hint: set to MAVLink to use MAVROS DISTANCE_SENSOR)', ff(rtype))
         else:
             info('RNGFND1_TYPE: unavailable')
-
         orient = get_param('RNGFND1_ORIENT', strict=False)
         if orient is not None:
             info('RNGFND1_ORIENT = %s', ff(orient))
-
         ek3rng = get_param('EK3_RNG_USE_HGT', strict=False)
         if ek3rng is not None:
             info('EK3_RNG_USE_HGT = %s', ff(ek3rng))
         return
 
-    # PX4 branches below (unchanged)
     est = get_param('SYS_MC_EST_GROUP')
     if est == 1:
         fuse = int(get_param('LPE_FUSION', 0))
@@ -900,11 +886,7 @@ def check_image():
         except IOError:
             info('no /etc/drone_version file')
 
-@check('Kernel version')
-def check_kernel():
-    output = subprocess.check_output(['uname', '-a'])
-    output = output.decode('utf-8').strip()
-    info('Kernel: %s', output)
+
 
 @check('Preflight status')
 def check_preflight_status():
@@ -970,38 +952,31 @@ def check_preflight_status():
                 failure(' '.join([match.groups()[1], 'check:', check_status]))
 
 
-# @check('Network')
-# def check_network():
-#     if not os.path.exists('/etc/drone_version'):
-#         # TODO:
-#         return
-
-#     ros_hostname = os.environ.get('ROS_HOSTNAME', '').strip()
-
-#     if not ros_hostname:
-#         failure('no ROS_HOSTNAME is set')
-
-#     elif ros_hostname.endswith('.local'):
-#         # using mdns hostname
-#         hosts = open('/etc/hosts', 'r')
-#         for line in hosts:
-#             parts = line.split()
-#             if len(parts) < 2:
-#                 continue
-#             ip = parts.pop(0).split('.')
-#             if ip[0] == '127':  # loopback ip
-#                 if ros_hostname in parts:
-#                     break
-#         else:
-#             failure('not found %s in /etc/hosts, ROS will malfunction if network interfaces are down', ros_hostname)
-
+@check('Network')
 def check_network():
-    hostname = os.getenv('ROS_HOSTNAME')
-    ros_ip = os.getenv('ROS_IP')
-    if not hostname and not ros_ip:
-        failure('Network: no ROS_HOSTNAME is set')
-    else:
-        info('Network: OK')
+    if not os.path.exists('/etc/drone_version'):
+        # TODO:
+        return
+
+    ros_hostname = os.environ.get('ROS_HOSTNAME', '').strip()
+
+    if not ros_hostname:
+        failure('no ROS_HOSTNAME is set')
+
+    elif ros_hostname.endswith('.local'):
+        # using mdns hostname
+        hosts = open('/etc/hosts', 'r')
+        for line in hosts:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            ip = parts.pop(0).split('.')
+            if ip[0] == '127':  # loopback ip
+                if ros_hostname in parts:
+                    break
+        else:
+            failure('not found %s in /etc/hosts, ROS will malfunction if network interfaces are down', ros_hostname)
+
 
 @check('RPi health')
 def check_rpi_health():
@@ -1054,10 +1029,10 @@ def check_rpi_health():
 
 @check('Board')
 def check_board():
-    output = subprocess.check_output(['cat', '/proc/device-tree/model'])
-    output = output.decode('utf-8')
-    output = output.strip('\0')
-    info('Board: %s', output)
+    try:
+        info('%s', open('/proc/device-tree/model').readline())
+    except IOError:
+        info('could not open /proc/device-tree/model, not a Raspberry Pi?')
 
 
 def parallel_for(fns):
@@ -1078,7 +1053,6 @@ def consequentially_for(fns):
 def selfcheck():
     checks = [
         check_image,
-        check_kernel,
         check_board,
         check_drone_service,
         check_network,

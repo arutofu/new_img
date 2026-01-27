@@ -1,5 +1,6 @@
 <launch>
     <arg name="fcu_conn" default="usb"/>
+    <arg name="usb_device" default="/dev/ttyACM0"/> <!-- NEW -->
     <arg name="fcu_ip" default="127.0.0.1"/>
     <arg name="fcu_sys_id" default="1"/>
     <arg name="gcs_bridge" default="tcp"/>
@@ -25,7 +26,10 @@
         <arg name="fcu_ip" value="$(arg fcu_ip)"/>
         <arg name="fcu_sys_id" value="$(arg fcu_sys_id)"/>
         <arg name="gcs_bridge" value="$(arg gcs_bridge)"/>
+	    <arg name="usb_device" value="$(arg usb_device)"/> <!-- NEW -->
     </include>
+
+    <node pkg="drone" type="ardupilot" name="ardupilot_adapter" output="screen" respawn="false" />
 
     <!-- web video server -->
     <node name="web_video_server" pkg="web_video_server" type="web_video_server" if="$(arg web_video_server)" required="false" respawn="true" respawn_delay="5">
@@ -45,7 +49,7 @@
         <remap from="camera_info" to="main_camera/camera_info"/>
         <param name="calc_flow_gyro" value="true"/>
         <param name="roi_rad" value="0.8"/>
-        <param name="disable_on_vpe" value="true"/>
+        <param name="disable_on_vpe" value="false"/>
     </node>
 
     <!-- simplified offboard control -->

@@ -10,19 +10,18 @@ SCRIPTS := $(ROOT)/scripts
 
 .DEFAULT_GOAL := help
 
-.PHONY: help deps fetch unpack build test clean
-
-.PHONY: build_drone
+.PHONY: help deps fetch unpack middle final build build_drone test clean
 
 help:
 	@echo "Targets:"
-	@echo "  make deps      - зависимости в WSL (loop/kpartx/qemu/etc)"
-	@echo "  make fetch     - скачать base .img.xz в cache/"
-	@echo "  make unpack    - распаковать base в build/base.img"
-	@echo "  make build     - полный билд (expand -> provision -> shrink -> out/*.img)"
-	@echo "  make test      - smoke-test последнего out/*.img"
-	@echo "  make clean     - удалить build/* (cache не трогаем)"
-	@echo "  Порядок команд: deps, fetch, unpack, build, test"
+	@echo "  make deps        - установить зависимости на хосте (WSL) (loop/qemu/binfmt/etc)"
+	@echo "  make fetch       - скачать базовый образ в cache/"
+	@echo "  make unpack      - распаковать базовый образ в build/base.img"
+	@echo "  make middle      - собрать build/middle.img (тяжёлые пакеты/ROS/deps)"
+	@echo "  make final       - собрать финальный out/*.img.xz на основе middle.img"
+	@echo "  make build       - middle (если нужно) + final (полная сборка)"
+	@echo "  make test        - test последнего out/*.img.xz"
+	@echo "  make clean       - очистить build/*"
 
 deps:
 	@sudo bash $(SCRIPTS)/deps.sh
@@ -33,14 +32,17 @@ fetch:
 unpack:
 	@sudo bash $(SCRIPTS)/unpack.sh $(ENV) $(CACHE) $(BUILD)
 
+middle:
+	@sudo bash $(SCRIPTS)/build_middle.sh $(ENV) $(CACHE) $(BUILD)
+
+final:
+	@sudo bash $(SCRIPTS)/build_final.sh $(ENV) $(CACHE) $(BUILD) $(OUT)
+
 build:
 	@sudo bash $(SCRIPTS)/build.sh $(ENV) $(CACHE) $(BUILD) $(OUT)
 
-build_drone:
-	@sudo bash $(SCRIPTS)/build.sh $(ENV) $(CACHE) $(BUILD) $(OUT) --with-drone
-
 test:
-	@sudo bash $(SCRIPTS)/smoke_test.sh $(OUT)
+	@bash $(SCRIPTS)/test.sh $(OUT)
 
 clean:
 	@sudo rm -rf $(BUILD)/*
